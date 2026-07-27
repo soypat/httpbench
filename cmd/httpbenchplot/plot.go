@@ -367,43 +367,6 @@ func trimFloat(v float64) string {
 	return strings.TrimSuffix(s, ".0")
 }
 
-// nominalX labels the X axis with the workload names, keeping the axis numeric
-// so the lines still connect across it.
-func nominalX(p *plot.Plot, names []string) {
-	ticks := make([]plot.Tick, len(names))
-	for i, name := range names {
-		ticks[i] = plot.Tick{Value: float64(i), Label: name}
-	}
-	p.X.Tick.Marker = plot.ConstantTicks(ticks)
-	p.X.Min = -0.3
-	p.X.Max = float64(len(names)) - 0.7
-}
-
-// drawPerRequest is the headline: what one answer costs the server that gave it.
-func (d *drawer) drawPerRequest(rep *report.Report, path string) error {
-	rows := workloadRows(rep)
-	if len(rows) == 0 {
-		return errNoRows
-	}
-	heap := func(r report.Result) float64 { return r.HeapPerReq }
-	order := scenarioOrder(rows)
-	all := groupSeries(rows, order, heap)
-	p := newPlot("Heap allocated per request (log scale, lower is better)",
-		"Workload", "Bytes allocated per request")
-	logY(p, byteTicks{})
-	if err := d.addSeries(p, all); err != nil {
-		return err
-	}
-	padLogAxis(&p.Y, all, func(pt plotter.XY) float64 { return pt.Y })
-	nominalX(p, order)
-	// A server measured at or below zero has no line on a log axis, and that is
-	// the result: it allocated nothing a sample could tell from noise.
-	if err := d.noteZeros(p, zeroSeriesNames(rows, heap), "at the noise floor, every workload"); err != nil {
-		return err
-	}
-	return p.Save(plotWidth, plotHeight, path)
-}
-
 // drawFlood puts what a server spends against what it was sent, which is where a
 // parser working in memory it took up front and one allocating per field stop
 // resembling each other.

@@ -9,6 +9,7 @@ import (
 
 	"github.com/soypat/httpbench"
 	"github.com/soypat/lneto/http/httphi"
+	"github.com/soypat/lneto/http/httpraw"
 )
 
 // implName is the name this server is reported under.
@@ -137,6 +138,37 @@ func (sv *Server) HandleEcho(ex *httphi.Exchange) {
 			return
 		}
 	}
+}
+
+var notPresent = []byte("not present")
+
+func (sv *Server) HandleQuery(ex *httphi.Exchange) {
+	buf := sv.AcquireUserBuffer()
+	defer sv.ReleaseUserBuffer(buf)
+	query, present := ex.AppendQuery(buf[:0], "query", true)
+	if present {
+		ex.WriteBody(query)
+	} else {
+		ex.WriteBody(notPresent)
+	}
+}
+
+func (sv *Server) HandleForm(ex *httphi.Exchange) {
+	var form httpraw.Form
+	buf := sv.AcquireUserBuffer()
+	defer sv.ReleaseUserBuffer(buf)
+	wbuf := sv.AcquireUserBuffer()
+	defer sv.ReleaseUserBuffer(wbuf)
+	ex.RequestParseForm(&form, buf)
+	form.Decode()
+	for i := range form.Len() {
+		k, v := form.Pair(i)
+		wbuf = append(wbuf, k...)
+		wbuf = append(wbuf, '=')
+		wbuf = append(wbuf, v...)
+		wbuf = append(wbuf, '\n')
+	}
+	ex.WriteBody(wbuf)
 }
 
 // HandleMetrics answers the sample every implementation owes the orchestrator.
