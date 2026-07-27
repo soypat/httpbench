@@ -27,7 +27,7 @@ func (flags *Flags) RegisterAndParseCommandline() error {
 	var addr string
 	flag.StringVar(&addr, "addr", ":8080", "Host address with port")
 	flag.IntVar(&flags.FixedGoroutines, "J", runtime.GOMAXPROCS(0), "Fixed number of goroutines for processing if available")
-	flag.IntVar(&flags.RequestBufferSize, "sz-req", 256, "Request header buffer size")
+	flag.IntVar(&flags.RequestBufferSize, "sz-req", 512, "Request header buffer size")
 	flag.IntVar(&flags.UserBufferSize, "sz-usr", 1024, "User buffer size")
 	flag.BoolVar(&flags.UseRawConn, "raw", true, "Use raw operating system call interface instead of net package.")
 	flag.Parse()
@@ -91,6 +91,7 @@ type rawConn struct {
 }
 
 func (rawConn *rawConn) Close() error {
+	err := rawConn.Conn.Close()
 	rawConn.src.rawconnpool.Put(rawConn)
-	return nil
+	return err
 }

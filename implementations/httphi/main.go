@@ -3,6 +3,8 @@ package main
 import (
 	"fmt"
 	"log"
+	"runtime"
+	"strconv"
 	"sync"
 	"time"
 
@@ -69,6 +71,7 @@ type Server struct {
 func (sv *Server) RegisterHandlers(mux *httphi.MuxSlice, flags httpbench.Flags) {
 	mux.Handle("GET /hello-world", sv.HandleHelloWorld)
 	mux.Handle("/echo", sv.HandleEcho)
+	mux.Handle("/memstat", sv.HandleMemstats)
 }
 
 func (sv *Server) HandleHelloWorld(ex *httphi.Exchange) {
@@ -88,6 +91,39 @@ func (sv *Server) HandleEcho(ex *httphi.Exchange) {
 			return
 		}
 	}
+}
+
+// expose memory stat
+func (sv *Server) HandleMemstats(ex *httphi.Exchange) {
+	var stats runtime.MemStats
+	runtime.ReadMemStats(&stats)
+	buf := sv.AcquireUserBuffer()
+	defer sv.ReleaseUserBuffer(buf)
+	dst := append(buf[:0], '{')
+	// Match field names so to easily use json package leveraging reflect.
+	// buf = appendJSONDictKey(buf, "alloc", stats.Alloc, true)
+	buf = appendJSONDictKey(dst, "TotalAlloc", stats.TotalAlloc, true)
+	dst = appendJSONDictKey(dst, "Mallocs", stats.Mallocs, true)
+	dst = appendJSONDictKey(dst, "Frees", stats.Frees, true)
+	dst = append(dst, '}')
+	ex.WriteBody(dst)
+}
+
+func appendJSONDictKey(dst []byte, key string, val any, termComma bool) []byte {
+	dst = append(dst, '"')
+	dst = append(dst, key...) // Simple, don't allow quotes or non-escapable characters.
+	dst = append(dst, '"', ':')
+	switch v := val.(type) {
+	case int64:
+		dst = strconv.AppendInt(dst, v, 10)
+	case uint64:
+		dst = strconv.AppendUint(dst, v, 10)
+
+	}
+	if termComma {
+		dst = append(dst, ',')
+	}
+	return dst
 }
 
 func (sv *Server) AcquireUserBuffer() []byte    { return sv.bufferPool.Get().([]byte) }
