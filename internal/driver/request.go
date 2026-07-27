@@ -19,15 +19,21 @@ import (
 
 // Routes every implementation serves.
 const (
-	RouteHello = "/hello-world"
-	RouteEcho  = "/echo"
+	RouteHello     = "/hello-world"
+	RouteEcho      = "/echo"
+	RouteQuery     = "/query"
+	RouteForm      = "/form"
+	RouteMultipart = "/multipart"
 )
 
 // Scenario names, which are also what a report calls its rows.
 const (
-	ScenarioHello = "hello"
-	ScenarioEcho  = "echo"
-	ScenarioFlood = "headerflood"
+	ScenarioHello     = "hello"
+	ScenarioEcho      = "echo"
+	ScenarioFlood     = "headerflood"
+	ScenarioQuery     = "query"
+	ScenarioForm      = "form"
+	ScenarioMultipart = "multipart"
 )
 
 // RequestSet is a scenario's requests, serialized once. A requester that
@@ -117,6 +123,157 @@ func FloodSet(variants, blockBytes int) *RequestSet {
 		set.wantBody = append(set.wantBody, nil)
 	}
 	return set
+}
+
+// QuerySet asks for one parameter out of a query string that holds several,
+// percent-encoded, and expects it back decoded. It is the cheapest scenario
+// that makes a server parse rather than copy, and the last variant leaves the
+// parameter out so the absent case is measured too — a server that only ever
+// sees the parameter present is not being asked the harder half of the
+// question.
+func QuerySet(variants int) *RequestSet {
+	set := &RequestSet{Scenario: ScenarioQuery, wantStatus: 200}
+	for i := 0; i < variants; i++ {
+		target := []byte(RouteQuery + "?first=" + strconv.Itoa(i) + "&")
+		want := notPresentBody
+		if i < variants-1 { // Last variant omits the parameter entirely.
+			value := queryValues[i%len(queryValues)]
+			target = formEncode(append(target, "query="...), value)
+			target = append(target, '&')
+			want = []byte(value)
+		}
+		target = append(target, "last=end"...)
+		req := append([]byte("GET "), target...)
+		req = append(req, " HTTP/1.1\r\nHost: bench\r\n"...)
+		req = append(req, noiseHeaders(nil, i)...)
+		set.wire = append(set.wire, append(req, '\r', '\n'))
+		set.wantBody = append(set.wantBody, want)
+	}
+	return set
+}
+
+// FormSet posts an urlencoded body and expects every pair back, decoded, one
+// per line. Keys and values both carry escapes, since a form parser that
+// decodes only values is a parser that has not been tested.
+//
+// The pairs are sent in the order their decoded keys sort in. A server that
+// keeps wire order and one that keeps its pairs in a map then sorts them agree
+// on this body and on no other, which is what lets one expected answer be
+// checked against both.
+func FormSet(variants int) *RequestSet {
+	set := &RequestSet{Scenario: ScenarioForm, wantStatus: 200}
+	for i := 0; i < variants; i++ {
+		var body, want []byte
+		for j, key := range formKeys {
+			value := formValues[(i+j)%len(formValues)]
+			if j > 0 {
+				body = append(body, '&')
+			}
+			body = formEncode(append(formEncode(body, key), '='), value)
+			want = append(append(append(append(want, key...), '='), value...), '\n')
+		}
+		req := []byte("POST " + RouteForm + " HTTP/1.1\r\nHost: bench\r\n" +
+			"Content-Type: application/x-www-form-urlencoded\r\nContent-Length: ")
+		req = strconv.AppendInt(req, int64(len(body)), 10)
+		req = append(req, "\r\n\r\n"...)
+		set.wire = append(set.wire, append(req, body...))
+		set.wantBody = append(set.wantBody, want)
+	}
+	return set
+}
+
+// MultipartSet posts a "multipart/form-data" body and expects one line per
+// part: its name, its filename after a ';' when it has one, and its content.
+//
+// It is the scenario a streaming parser is built for. Parts declare no length,
+// so a server either reads them through a buffer it owns or holds the whole
+// body — and one part's content carries a CRLF and a line that starts like a
+// delimiter without being one, so a parser that scans for "--" rather than for
+// the boundary answers wrongly rather than slowly.
+func MultipartSet(variants int) *RequestSet {
+	set := &RequestSet{Scenario: ScenarioMultipart, wantStatus: 200}
+	for i := 0; i < variants; i++ {
+		boundary := "httpbench" + strconv.Itoa(i) + "Boundary"
+		var body, want []byte
+		for j, part := range multipartParts {
+			content := part.content + strconv.Itoa(i)
+			body = append(body, "--"+boundary+"\r\nContent-Disposition: form-data; name=\""+part.name+"\""...)
+			want = append(want, part.name...)
+			if part.filename != "" {
+				body = append(body, "; filename=\""+part.filename+"\""...)
+				want = append(append(want, ';'), part.filename...)
+			}
+			body = append(body, "\r\nContent-Type: "+multipartContentType(j)+"\r\n\r\n"...)
+			body = append(append(body, content...), '\r', '\n')
+			want = append(append(append(want, '='), content...), '\n')
+		}
+		body = append(body, "--"+boundary+"--\r\n"...)
+		req := []byte("POST " + RouteMultipart + " HTTP/1.1\r\nHost: bench\r\n" +
+			"Content-Type: multipart/form-data; boundary=" + boundary + "\r\nContent-Length: ")
+		req = strconv.AppendInt(req, int64(len(body)), 10)
+		req = append(req, "\r\n\r\n"...)
+		set.wire = append(set.wire, append(req, body...))
+		set.wantBody = append(set.wantBody, want)
+	}
+	return set
+}
+
+// notPresentBody is what a server answers when the query parameter is absent.
+// Both implementations say it in the same words so the answer can be checked
+// rather than merely counted.
+var notPresentBody = []byte("not present")
+
+// queryValues are values that survive a round trip only if the server decoded
+// them: a space, a '+' that is a plus rather than a space once encoded, the
+// separators of the encoding itself, and bytes above ASCII.
+var queryValues = []string{
+	"hello world",
+	"a+b=c&d",
+	"100% sure",
+	"ünïcøde/ø",
+	"tab\tand slash/",
+}
+
+var (
+	// formKeys are in the order their decoded forms sort in; the first carries
+	// an escape so key decoding is exercised too.
+	formKeys   = [...]string{"a b", "alpha", "beta"}
+	formValues = [...]string{"one two", "=&%", "ünïcøde", "", "trailing "}
+)
+
+var multipartParts = [...]struct{ name, filename, content string }{
+	{name: "alpha", content: "first part "},
+	// Content that lies about where it ends: a bare "--" line and a CRLF.
+	{name: "beta", content: "line one\r\n--not-the-boundary\r\nline two "},
+	{name: "file", filename: "note.txt", content: "file contents "},
+}
+
+// multipartContentType varies what parts declare, since a part's own
+// Content-Type is a field the parser must skip past to reach the content.
+func multipartContentType(part int) string {
+	if part%2 == 0 {
+		return "text/plain; charset=utf-8"
+	}
+	return "application/octet-stream"
+}
+
+// formEncode appends s to dst percent-encoded the way a form is: unreserved
+// bytes as themselves, a space as '+', everything else as an escape.
+func formEncode(dst []byte, s string) []byte {
+	const hexDigits = "0123456789ABCDEF"
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == ' ':
+			dst = append(dst, '+')
+		case 'a' <= c && c <= 'z', 'A' <= c && c <= 'Z', '0' <= c && c <= '9',
+			c == '-', c == '_', c == '.', c == '~':
+			dst = append(dst, c)
+		default:
+			dst = append(dst, '%', hexDigits[c>>4], hexDigits[c&0xf])
+		}
+	}
+	return dst
 }
 
 // MetricsRequest is the out-of-band sample request. It is written on its own

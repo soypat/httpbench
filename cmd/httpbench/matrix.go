@@ -389,6 +389,10 @@ func measureServer(cfg matrixConfig, path string, size int64, dir, transport str
 	for _, size := range cfg.echoSizes {
 		sets = append(sets, driver.EchoSet(8, size))
 	}
+	// The parsing workloads, in order of what they make the server take apart:
+	// a query string, an urlencoded body, then a body whose parts declare no
+	// length at all.
+	sets = append(sets, driver.QuerySet(8), driver.FormSet(8), driver.MultipartSet(8))
 	for _, set := range sets {
 		for _, keepAlive := range modes {
 			row, err := measure(c, set, cfg, cfg.workloadConns, cfg.requests, keepAlive, cost)

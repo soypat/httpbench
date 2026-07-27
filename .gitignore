@@ -1,7 +1,7 @@
 # Server binaries, rebuilt by the orchestrator before every matrix so a stale
 # one is never measured.
 bin/
-plots/
 REPORT.md
 NOTES-approach.md
+/plots-local
 *.json

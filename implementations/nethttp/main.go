@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"sync"
 
@@ -39,7 +40,13 @@ func main() {
 
 func run(flags httpbench.Flags) error {
 	var server Server
-	server.bufferPool.New = func() any { return make([]byte, flags.UserBufferSize) }
+	// Pooled by pointer for the reason the httphi server gives: a slice put
+	// into a [sync.Pool] boxes its header, and that allocation would be
+	// counted against the handler rather than against the harness.
+	server.bufferPool.New = func() any {
+		buf := make([]byte, flags.UserBufferSize)
+		return &buf
+	}
 	var err error
 	server.sampler, err = httpbench.NewSampler()
 	if err != nil {
@@ -74,6 +81,9 @@ type Server struct {
 func (sv *Server) RegisterHandlers(mux *http.ServeMux, flags httpbench.Flags) {
 	mux.HandleFunc("GET /hello-world", sv.HandleHelloWorld)
 	mux.HandleFunc("/echo", sv.HandleEcho)
+	mux.HandleFunc("GET /query", sv.HandleQuery)
+	mux.HandleFunc("POST /form", sv.HandleForm)
+	mux.HandleFunc("POST /multipart", sv.HandleMultipart)
 	mux.HandleFunc("GET "+httpbench.RouteMetrics, sv.HandleMetrics)
 }
 
@@ -93,8 +103,9 @@ func (sv *Server) HandleEcho(w http.ResponseWriter, r *http.Request) {
 	// reaches the wire, as [http.ResponseWriter] warns it may, and the answer
 	// is silently short by whatever had not been read yet.
 	http.NewResponseController(w).EnableFullDuplex()
-	buf := sv.AcquireUserBuffer()
-	defer sv.ReleaseUserBuffer(buf)
+	pooled := sv.AcquireUserBuffer()
+	defer sv.ReleaseUserBuffer(pooled)
+	buf := *pooled
 	if r.ContentLength <= 0 {
 		w.Header().Set("Content-Length", "0")
 		w.WriteHeader(http.StatusOK)
@@ -119,14 +130,110 @@ func (sv *Server) HandleEcho(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+var notPresent = []byte("not present")
+
+// HandleQuery answers with one parameter of the query string, decoded, the way
+// a Go server reads one: net/http parses the whole query into a map of slices
+// of strings to hand back a single value.
+func (sv *Server) HandleQuery(w http.ResponseWriter, r *http.Request) {
+	body := notPresent
+	if query := r.URL.Query(); query.Has("query") {
+		body = []byte(query.Get("query"))
+	}
+	writeBody(w, body)
+}
+
+// HandleForm answers with every pair of an urlencoded body, decoded, one per
+// line.
+//
+// The pairs come back sorted by key, because [http.Request.PostForm] is a map
+// and a map has no order to preserve. The corpus sends its pairs in that same
+// order so the answer can be compared with a server that kept wire order; the
+// sort is what a handler over a map has to do to get there.
+func (sv *Server) HandleForm(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad form", http.StatusBadRequest)
+		return
+	}
+	keys := make([]string, 0, len(r.PostForm))
+	for key := range r.PostForm {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	pooled := sv.AcquireUserBuffer()
+	defer sv.ReleaseUserBuffer(pooled)
+	body := (*pooled)[:0]
+	for _, key := range keys {
+		for _, value := range r.PostForm[key] {
+			body = append(body, key...)
+			body = append(body, '=')
+			body = append(body, value...)
+			body = append(body, '\n')
+		}
+	}
+	writeBody(w, body)
+}
+
+// HandleMultipart answers with one line per part: its name, its filename when
+// it has one, and its content.
+//
+// It streams with [http.Request.MultipartReader] rather than ParseMultipartForm,
+// which is the fair comparison: the latter buffers what fits and spills the
+// rest to files in the temporary directory, so what it costs is not only memory.
+func (sv *Server) HandleMultipart(w http.ResponseWriter, r *http.Request) {
+	parts, err := r.MultipartReader()
+	if err != nil {
+		http.Error(w, "bad multipart", http.StatusBadRequest)
+		return
+	}
+	pooled := sv.AcquireUserBuffer()
+	defer sv.ReleaseUserBuffer(pooled)
+	pooledOut := sv.AcquireUserBuffer()
+	defer sv.ReleaseUserBuffer(pooledOut)
+	buf := *pooled
+	body := (*pooledOut)[:0]
+	for {
+		part, err := parts.NextPart()
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			http.Error(w, "bad part", http.StatusBadRequest)
+			return
+		}
+		body = append(body, part.FormName()...)
+		if name := part.FileName(); name != "" {
+			body = append(body, ';')
+			body = append(body, name...)
+		}
+		body = append(body, '=')
+		for {
+			n, err := part.Read(buf)
+			body = append(body, buf[:n]...)
+			if err != nil {
+				break // Part ended, or the body did; the next NextPart tells which.
+			}
+		}
+		body = append(body, '\n')
+	}
+	writeBody(w, body)
+}
+
+// writeBody answers 200 with body, framed by its length. Nothing is written
+// until the whole answer is known, so a handler that fails halfway can still
+// answer with a status instead of a truncated body.
+func writeBody(w http.ResponseWriter, body []byte) {
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.Write(body)
+}
+
 // HandleMetrics answers the sample the orchestrator reads, in the same shape
 // and from the same counters as every other Go implementation.
 func (sv *Server) HandleMetrics(w http.ResponseWriter, r *http.Request) {
 	var smp httpbench.Sample
 	sv.sampler.Read(&smp)
-	buf := sv.AcquireUserBuffer()
-	defer sv.ReleaseUserBuffer(buf)
-	body := smp.AppendJSON(buf[:0])
+	pooled := sv.AcquireUserBuffer()
+	defer sv.ReleaseUserBuffer(pooled)
+	body := smp.AppendJSON((*pooled)[:0])
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	w.Write(body)
@@ -141,5 +248,5 @@ func debugWriter() io.Writer {
 	return io.Discard
 }
 
-func (sv *Server) AcquireUserBuffer() []byte    { return sv.bufferPool.Get().([]byte) }
-func (sv *Server) ReleaseUserBuffer(buf []byte) { sv.bufferPool.Put(buf) }
+func (sv *Server) AcquireUserBuffer() *[]byte    { return sv.bufferPool.Get().(*[]byte) }
+func (sv *Server) ReleaseUserBuffer(buf *[]byte) { sv.bufferPool.Put(buf) }

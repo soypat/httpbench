@@ -14,7 +14,7 @@ cd "$(dirname "$0")"
 
 JSON=${JSON:-results.json}
 REPORT=${REPORT:-REPORT.md}
-PLOT_DIR=${PLOT_DIR:-plots}
+PLOT_DIR=${PLOT_DIR:-plots-local}
 BIN_DIR=${BIN_DIR:-bin}
 
 # Passed through as -requests=N when set, so the common case needs no flag

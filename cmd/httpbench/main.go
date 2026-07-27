@@ -137,7 +137,8 @@ func runMatrix(args []string) error {
 func runDrive(args []string) error {
 	fs := flag.NewFlagSet("drive", flag.ExitOnError)
 	addr := fs.String("addr", "", "address of a server to drive")
-	scenario := fs.String("scenario", driver.ScenarioHello, "hello, echo or headerflood")
+	scenario := fs.String("scenario", driver.ScenarioHello,
+		"hello, echo, query, form, multipart or headerflood")
 	size := fs.Int("size", 1024, "echo body size or flood header block size, bytes")
 	conns := fs.Int("conns", 1, "connections held open in parallel")
 	requests := fs.Int("requests", 2000, "requests in total across connections")
@@ -154,6 +155,12 @@ func runDrive(args []string) error {
 		set = driver.HelloSet(8)
 	case driver.ScenarioEcho:
 		set = driver.EchoSet(8, *size)
+	case driver.ScenarioQuery:
+		set = driver.QuerySet(8)
+	case driver.ScenarioForm:
+		set = driver.FormSet(8)
+	case driver.ScenarioMultipart:
+		set = driver.MultipartSet(8)
 	case driver.ScenarioFlood:
 		set = driver.FloodSet(4, *size)
 	default:
