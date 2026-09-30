@@ -6,7 +6,6 @@ import (
 	"log"
 	"os"
 	"sync"
-	"time"
 
 	"github.com/soypat/httpbench"
 	"github.com/soypat/lneto/http/httphi"
@@ -32,24 +31,7 @@ func main() {
 	}
 }
 
-func run(flags httpbench.Flags) error {
-	var mux httphi.MuxSlice
-	mux.Reset(8) // Routes registered below, plus room for one more.
-
-	var router httphi.Router
-	err := router.Configure(httphi.RouterConfig{
-		Mux:                         &mux,
-		FixedNumGoroutines:          flags.FixedGoroutines,
-		RequestHeaderBufferSize:     flags.RequestBufferSize,
-		ResponseHeaderMinBufferSize: flags.RequestBufferSize,
-		RequestNumHeaderKVCap:       flags.RequestBufferSize / 32,
-		NormalizeOutgoingKeys:       false,
-		MaxAwaitingConns:            flags.FixedGoroutines,
-		Backoff:                     backoff,
-	})
-	if err != nil {
-		return err
-	}
+func run(flags httpbench.Flags) (err error) {
 	var server Server
 	// Pooled by pointer: putting a slice into a [sync.Pool] boxes its header,
 	// which is an allocation per request charged to the handler for something
@@ -62,7 +44,20 @@ func run(flags httpbench.Flags) error {
 	if err != nil {
 		return err
 	}
+	var mux httphi.MuxSlice
 	server.RegisterHandlers(&mux, flags)
+
+	var router httphi.Router
+	err = router.Configure(&mux, httphi.RouterConfig{
+		FixedNumGoroutines:          flags.FixedGoroutines,
+		RequestHeaderBufferSize:     flags.RequestBufferSize,
+		ResponseHeaderMinBufferSize: flags.RequestBufferSize,
+		RequestNumHeaderKVCap:       flags.RequestBufferSize / 32,
+		NormalizeOutgoingKeys:       false,
+	})
+	if err != nil {
+		return err
+	}
 
 	listener, err := httpbench.Listen(flags)
 	if err != nil {
@@ -70,7 +65,7 @@ func run(flags httpbench.Flags) error {
 	}
 	fmt.Println(flags.ReadyLine(listener.Addr(), implName, flagMapping))
 	os.Stdout.Sync()
-	defer router.TeardownGoroutines()
+	defer router.Shutdown()
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -111,7 +106,7 @@ func (sv *Server) HandleHelloWorld(ex *httphi.Exchange) {
 	// Every answer carries its length. Without it the answer is delimited by
 	// the connection closing, which costs a round trip the measurement would
 	// then be attributing to the server.
-	ex.StageHeaderInt("Content-Length", int64(len(helloWorld)), 10)
+	ex.StageHeaderInt("Content-Length", int64(len(helloWorld)))
 	ex.WriteBody(helloWorld)
 }
 
@@ -128,17 +123,16 @@ func (sv *Server) HandleEcho(ex *httphi.Exchange) {
 	pooled := sv.AcquireUserBuffer()
 	defer sv.ReleaseUserBuffer(pooled)
 	buf := *pooled
-	contentLength, _ := ex.RequestContentLength() // Absent means no body, not an error.
+	contentLength, _, _ := ex.RequestContentLength() // Absent means no body, not an error.
 	if contentLength <= 0 {
-		ex.StageHeaderInt("Content-Length", 0, 10)
-		ex.WriteHeader(200)
+		ex.Respond(200, "", nil)
 		return
 	}
 	n, err := ex.ReadBody(buf)
 	if err != nil && n == 0 {
 		return
 	}
-	ex.StageHeaderInt("Content-Length", contentLength, 10)
+	ex.StageHeaderInt("Content-Length", contentLength)
 	for read := 0; ; {
 		if _, err = ex.WriteBody(buf[:n]); err != nil {
 			return
@@ -165,12 +159,11 @@ var notPresent = []byte("not present")
 func (sv *Server) HandleQuery(ex *httphi.Exchange) {
 	pooled := sv.AcquireUserBuffer()
 	defer sv.ReleaseUserBuffer(pooled)
-	body, present := ex.AppendQuery((*pooled)[:0], "query", true)
+	body, present := ex.RequestQueryAppend((*pooled)[:0], "query", true)
 	if !present {
 		body = notPresent
 	}
-	ex.StageHeaderInt("Content-Length", int64(len(body)), 10)
-	ex.WriteBody(body)
+	ex.Respond(200, "", body)
 }
 
 // HandleForm answers with every pair of an urlencoded body, decoded, one per
@@ -187,14 +180,14 @@ func (sv *Server) HandleForm(ex *httphi.Exchange) {
 	defer sv.ReleaseUserBuffer(pooledOut)
 	form := sv.AcquireForm()
 	defer sv.ReleaseForm(form)
-	err := ex.RequestParseForm(form, *pooled)
+	err := ex.RequestParseForm(form, true, true)
 	if err == nil {
 		err = form.Decode()
 	}
 	if err != nil {
 		// A body that is not a form, or is longer than the buffer it would be
 		// parsed in. Either way nothing was answered from it.
-		writeStatus(ex, 400)
+		ex.Respond(400, "", nil)
 		return
 	}
 	body := (*pooledOut)[:0]
@@ -205,8 +198,7 @@ func (sv *Server) HandleForm(ex *httphi.Exchange) {
 		body = append(body, v...)
 		body = append(body, '\n')
 	}
-	ex.StageHeaderInt("Content-Length", int64(len(body)), 10)
-	ex.WriteBody(body)
+	ex.Respond(200, "", body)
 }
 
 // HandleMultipart answers with one line per part of a "multipart/form-data"
@@ -228,11 +220,10 @@ func (sv *Server) HandleMultipart(ex *httphi.Exchange) {
 	// the next request finds them already sized.
 	sink.parts = parts
 	if err != nil {
-		writeStatus(ex, 400)
+		ex.Respond(400, "", nil)
 		return
 	}
-	ex.StageHeaderInt("Content-Length", int64(len(sink.body)), 10)
-	ex.WriteBody(sink.body)
+	ex.Respond(200, "", sink.body)
 }
 
 // partSink is where every part of one multipart body is written: the answer
@@ -267,14 +258,6 @@ func (s *partSink) Close() error {
 	return nil
 }
 
-// writeStatus answers with a status and no body. The length is stated even when
-// it is zero, so a requester never has to wait for the connection to close to
-// know the answer ended.
-func writeStatus(ex *httphi.Exchange, code int) {
-	ex.StageHeaderInt("Content-Length", 0, 10)
-	ex.WriteHeader(code)
-}
-
 // HandleMetrics answers the sample every implementation owes the orchestrator.
 // It formats into a pooled buffer with [httpbench.Sample.AppendJSON], which
 // allocates nothing, so what the endpoint costs is a syscall and a GC rather
@@ -285,9 +268,7 @@ func (sv *Server) HandleMetrics(ex *httphi.Exchange) {
 	pooled := sv.AcquireUserBuffer()
 	defer sv.ReleaseUserBuffer(pooled)
 	body := smp.AppendJSON((*pooled)[:0])
-	ex.StageHeader("Content-Type", "application/json")
-	ex.StageHeaderInt("Content-Length", int64(len(body)), 10)
-	ex.WriteBody(body)
+	ex.Respond(200, "application/json", body)
 }
 
 func (sv *Server) AcquireUserBuffer() *[]byte    { return sv.bufferPool.Get().(*[]byte) }
@@ -312,7 +293,3 @@ func (sv *Server) AcquirePartSink() *partSink {
 }
 
 func (sv *Server) ReleasePartSink(sink *partSink) { sv.partPool.Put(sink) }
-
-func backoff(consecutiveBackoffs uint) time.Duration {
-	return min(time.Millisecond, 1<<consecutiveBackoffs)
-}
